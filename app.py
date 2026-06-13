@@ -11,14 +11,17 @@ Endpoints:
   GET /api/indices     -> list of available indices
   GET /api/scan        -> run the scan
       query params:
-        index   = nifty50 | banknifty | nifty100 | sensex   (default nifty50)
+        index   = nifty50 | banknifty | nifty100 | sensex | fno   (default nifty50)
         minRed  = integer, minimum consecutive red candles   (default 3)
+  GET /api/fno-list    -> debug: current F&O stock list and source
 """
 
 from flask import Flask, jsonify, request
 import requests
 from datetime import datetime
 import time
+import csv
+import io
 
 app = Flask(__name__)
 
@@ -31,8 +34,237 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
+
 # ──────────────────────────────────────────────────────────
-# Static index constituent lists (F&O eligible NSE stocks)
+# F&O eligible stock list — fetched live from NSE, cached
+# ──────────────────────────────────────────────────────────
+NSE_FO_CSV_URL = "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
+
+_fno_cache = {"data": None, "fetched_at": 0}
+FNO_CACHE_TTL = 6 * 60 * 60  # 6 hours
+
+# Fallback list used only if NSE CSV fetch fails (kept reasonably current)
+FALLBACK_FNO_STOCKS = [
+    {"s": "RELIANCE", "n": "Reliance Industries"},
+    {"s": "TCS", "n": "Tata Consultancy Services"},
+    {"s": "HDFCBANK", "n": "HDFC Bank"},
+    {"s": "ICICIBANK", "n": "ICICI Bank"},
+    {"s": "INFY", "n": "Infosys"},
+    {"s": "HINDUNILVR", "n": "Hindustan Unilever"},
+    {"s": "ITC", "n": "ITC"},
+    {"s": "SBIN", "n": "State Bank of India"},
+    {"s": "BHARTIARTL", "n": "Bharti Airtel"},
+    {"s": "KOTAKBANK", "n": "Kotak Mahindra Bank"},
+    {"s": "AXISBANK", "n": "Axis Bank"},
+    {"s": "LT", "n": "Larsen & Toubro"},
+    {"s": "HCLTECH", "n": "HCL Technologies"},
+    {"s": "WIPRO", "n": "Wipro"},
+    {"s": "ASIANPAINT", "n": "Asian Paints"},
+    {"s": "MARUTI", "n": "Maruti Suzuki"},
+    {"s": "NTPC", "n": "NTPC"},
+    {"s": "POWERGRID", "n": "Power Grid Corp"},
+    {"s": "SUNPHARMA", "n": "Sun Pharma"},
+    {"s": "ULTRACEMCO", "n": "UltraTech Cement"},
+    {"s": "TATAMOTORS", "n": "Tata Motors"},
+    {"s": "ONGC", "n": "ONGC"},
+    {"s": "BAJFINANCE", "n": "Bajaj Finance"},
+    {"s": "BAJAJFINSV", "n": "Bajaj Finserv"},
+    {"s": "TECHM", "n": "Tech Mahindra"},
+    {"s": "TITAN", "n": "Titan Company"},
+    {"s": "NESTLEIND", "n": "Nestle India"},
+    {"s": "DIVISLAB", "n": "Divi's Laboratories"},
+    {"s": "DRREDDY", "n": "Dr Reddy's Labs"},
+    {"s": "CIPLA", "n": "Cipla"},
+    {"s": "APOLLOHOSP", "n": "Apollo Hospitals"},
+    {"s": "ADANIPORTS", "n": "Adani Ports"},
+    {"s": "ADANIENT", "n": "Adani Enterprises"},
+    {"s": "JSWSTEEL", "n": "JSW Steel"},
+    {"s": "TATASTEEL", "n": "Tata Steel"},
+    {"s": "HINDALCO", "n": "Hindalco Industries"},
+    {"s": "COALINDIA", "n": "Coal India"},
+    {"s": "BPCL", "n": "Bharat Petroleum"},
+    {"s": "INDIGO", "n": "InterGlobe Aviation"},
+    {"s": "HDFCLIFE", "n": "HDFC Life Insurance"},
+    {"s": "SBILIFE", "n": "SBI Life Insurance"},
+    {"s": "BAJAJ-AUTO", "n": "Bajaj Auto"},
+    {"s": "HEROMOTOCO", "n": "Hero MotoCorp"},
+    {"s": "EICHERMOT", "n": "Eicher Motors"},
+    {"s": "M&M", "n": "Mahindra & Mahindra"},
+    {"s": "TATAPOWER", "n": "Tata Power"},
+    {"s": "GRASIM", "n": "Grasim Industries"},
+    {"s": "SHREECEM", "n": "Shree Cement"},
+    {"s": "BRITANNIA", "n": "Britannia Industries"},
+    {"s": "IOC", "n": "Indian Oil Corp"},
+    {"s": "PIDILITIND", "n": "Pidilite Industries"},
+    {"s": "SIEMENS", "n": "Siemens"},
+    {"s": "HAVELLS", "n": "Havells India"},
+    {"s": "VOLTAS", "n": "Voltas"},
+    {"s": "DABUR", "n": "Dabur India"},
+    {"s": "MARICO", "n": "Marico"},
+    {"s": "GODREJCP", "n": "Godrej Consumer"},
+    {"s": "LUPIN", "n": "Lupin"},
+    {"s": "AUROPHARMA", "n": "Aurobindo Pharma"},
+    {"s": "TORNTPHARM", "n": "Torrent Pharma"},
+    {"s": "ZOMATO", "n": "Zomato (Eternal)"},
+    {"s": "NAUKRI", "n": "Info Edge (Naukri)"},
+    {"s": "IRCTC", "n": "IRCTC"},
+    {"s": "CHOLAFIN", "n": "Cholamandalam Finance"},
+    {"s": "FEDERALBNK", "n": "Federal Bank"},
+    {"s": "IDFCFIRSTB", "n": "IDFC First Bank"},
+    {"s": "INDUSINDBK", "n": "IndusInd Bank"},
+    {"s": "PFC", "n": "Power Finance Corp"},
+    {"s": "RECLTD", "n": "REC Limited"},
+    {"s": "HAL", "n": "Hindustan Aeronautics"},
+    {"s": "BEL", "n": "Bharat Electronics"},
+    {"s": "TATAELXSI", "n": "Tata Elxsi"},
+    {"s": "BERGEPAINT", "n": "Berger Paints"},
+    {"s": "COLPAL", "n": "Colgate-Palmolive"},
+    {"s": "DLF", "n": "DLF"},
+    {"s": "BANKBARODA", "n": "Bank of Baroda"},
+    {"s": "PNB", "n": "Punjab National Bank"},
+    {"s": "MUTHOOTFIN", "n": "Muthoot Finance"},
+    {"s": "NMDC", "n": "NMDC"},
+    {"s": "VEDL", "n": "Vedanta"},
+    {"s": "SAIL", "n": "SAIL"},
+    {"s": "GAIL", "n": "GAIL India"},
+    {"s": "BANDHANBNK", "n": "Bandhan Bank"},
+    {"s": "AUBANK", "n": "AU Small Finance Bank"},
+    {"s": "ZYDUSLIFE", "n": "Zydus Lifesciences"},
+    {"s": "ABCAPITAL", "n": "Aditya Birla Capital"},
+    {"s": "ABFRL", "n": "Aditya Birla Fashion"},
+    {"s": "ALKEM", "n": "Alkem Laboratories"},
+    {"s": "AMBUJACEM", "n": "Ambuja Cements"},
+    {"s": "APOLLOTYRE", "n": "Apollo Tyres"},
+    {"s": "ASHOKLEY", "n": "Ashok Leyland"},
+    {"s": "ASTRAL", "n": "Astral Limited"},
+    {"s": "ATGL", "n": "Adani Total Gas"},
+    {"s": "BALKRISIND", "n": "Balkrishna Industries"},
+    {"s": "BHEL", "n": "BHEL"},
+    {"s": "BIOCON", "n": "Biocon"},
+    {"s": "BSOFT", "n": "Birlasoft"},
+    {"s": "CANBK", "n": "Canara Bank"},
+    {"s": "CHAMBLFERT", "n": "Chambal Fertilizers"},
+    {"s": "COFORGE", "n": "Coforge"},
+    {"s": "CONCOR", "n": "Container Corp"},
+    {"s": "CROMPTON", "n": "Crompton Greaves"},
+    {"s": "CUMMINSIND", "n": "Cummins India"},
+    {"s": "DALBHARAT", "n": "Dalmia Bharat"},
+    {"s": "DEEPAKNTR", "n": "Deepak Nitrite"},
+    {"s": "DIXON", "n": "Dixon Technologies"},
+    {"s": "ESCORTS", "n": "Escorts Kubota"},
+    {"s": "EXIDEIND", "n": "Exide Industries"},
+    {"s": "GMRAIRPORT", "n": "GMR Airports"},
+    {"s": "GODREJPROP", "n": "Godrej Properties"},
+    {"s": "GRANULES", "n": "Granules India"},
+    {"s": "HFCL", "n": "HFCL"},
+    {"s": "HINDCOPPER", "n": "Hindustan Copper"},
+    {"s": "HINDPETRO", "n": "Hindustan Petroleum"},
+    {"s": "IDEA", "n": "Vodafone Idea"},
+    {"s": "IEX", "n": "Indian Energy Exchange"},
+    {"s": "IGL", "n": "Indraprastha Gas"},
+    {"s": "INDHOTEL", "n": "Indian Hotels"},
+    {"s": "INDUSTOWER", "n": "Indus Towers"},
+    {"s": "JINDALSTEL", "n": "Jindal Steel & Power"},
+    {"s": "JIOFIN", "n": "Jio Financial Services"},
+    {"s": "JUBLFOOD", "n": "Jubilant FoodWorks"},
+    {"s": "KPITTECH", "n": "KPIT Technologies"},
+    {"s": "LAURUSLABS", "n": "Laurus Labs"},
+    {"s": "LICHSGFIN", "n": "LIC Housing Finance"},
+    {"s": "LODHA", "n": "Macrotech Developers"},
+    {"s": "LTF", "n": "L&T Finance"},
+    {"s": "LTIM", "n": "LTIMindtree"},
+    {"s": "M&MFIN", "n": "M&M Financial Services"},
+    {"s": "MANAPPURAM", "n": "Manappuram Finance"},
+    {"s": "MFSL", "n": "Max Financial Services"},
+    {"s": "MGL", "n": "Mahanagar Gas"},
+    {"s": "MOTHERSON", "n": "Samvardhana Motherson"},
+    {"s": "MPHASIS", "n": "Mphasis"},
+    {"s": "NATIONALUM", "n": "National Aluminium"},
+    {"s": "NAVINFLUOR", "n": "Navin Fluorine"},
+    {"s": "NBCC", "n": "NBCC India"},
+    {"s": "NCC", "n": "NCC Limited"},
+    {"s": "OBEROIRLTY", "n": "Oberoi Realty"},
+    {"s": "OFSS", "n": "Oracle Financial Services"},
+    {"s": "PAGEIND", "n": "Page Industries"},
+    {"s": "PATANJALI", "n": "Patanjali Foods"},
+    {"s": "PEL", "n": "Piramal Enterprises"},
+    {"s": "PERSISTENT", "n": "Persistent Systems"},
+    {"s": "PETRONET", "n": "Petronet LNG"},
+    {"s": "POLICYBZR", "n": "PB Fintech (PolicyBazaar)"},
+    {"s": "POLYCAB", "n": "Polycab India"},
+    {"s": "PRESTIGE", "n": "Prestige Estates"},
+    {"s": "RBLBANK", "n": "RBL Bank"},
+    {"s": "RVNL", "n": "Rail Vikas Nigam"},
+    {"s": "SBICARD", "n": "SBI Cards"},
+    {"s": "SHRIRAMFIN", "n": "Shriram Finance"},
+    {"s": "SRF", "n": "SRF Limited"},
+    {"s": "SUPREMEIND", "n": "Supreme Industries"},
+    {"s": "SUZLON", "n": "Suzlon Energy"},
+    {"s": "TATACHEM", "n": "Tata Chemicals"},
+    {"s": "TATACOMM", "n": "Tata Communications"},
+    {"s": "TATATECH", "n": "Tata Technologies"},
+    {"s": "TIINDIA", "n": "Tube Investments"},
+    {"s": "TORNTPOWER", "n": "Torrent Power"},
+    {"s": "TRENT", "n": "Trent Limited"},
+    {"s": "TVSMOTOR", "n": "TVS Motor"},
+    {"s": "UNIONBANK", "n": "Union Bank of India"},
+    {"s": "UNITDSPR", "n": "United Spirits"},
+    {"s": "UPL", "n": "UPL Limited"},
+    {"s": "VBL", "n": "Varun Beverages"},
+    {"s": "YESBANK", "n": "Yes Bank"},
+]
+
+
+def get_fno_stock_list():
+    """
+    Fetch the current F&O-eligible stock list from NSE's official CSV.
+    Cached for FNO_CACHE_TTL seconds. Falls back to a static list if
+    NSE is unreachable.
+    Returns a tuple (list of {"s": SYMBOL, "n": NAME} dicts, source string).
+    """
+    now = time.time()
+    if _fno_cache["data"] and (now - _fno_cache["fetched_at"] < FNO_CACHE_TTL):
+        return _fno_cache["data"], "cache"
+
+    try:
+        resp = requests.get(NSE_FO_CSV_URL, headers=YAHOO_HEADERS, timeout=10)
+        resp.raise_for_status()
+        content = resp.content.decode("utf-8", errors="ignore")
+
+        reader = csv.reader(io.StringIO(content))
+        rows = list(reader)
+
+        stocks = []
+        seen = set()
+        for row in rows:
+            if len(row) < 3:
+                continue
+            name = row[1].strip() if len(row) > 1 else ""
+            symbol = row[2].strip().upper() if len(row) > 2 else ""
+            # Skip header rows, blanks, and index futures (NIFTY, BANKNIFTY etc.)
+            if not symbol or symbol in ("SYMBOL", "UNDERLYING"):
+                continue
+            if symbol in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "NIFTY50"):
+                continue
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            stocks.append({"s": symbol, "n": name or symbol})
+
+        if len(stocks) < 50:
+            # Sanity check failed — CSV format may have changed
+            raise ValueError(f"Parsed only {len(stocks)} stocks, expected 150+")
+
+        _fno_cache["data"] = stocks
+        _fno_cache["fetched_at"] = now
+        return stocks, "live"
+
+    except Exception:
+        return FALLBACK_FNO_STOCKS, "fallback"
+
+
+# ──────────────────────────────────────────────────────────
+# Static index constituent lists (still available for index-based scans)
 # ──────────────────────────────────────────────────────────
 INDICES = {
     "nifty50": {
@@ -305,17 +537,29 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "RedScan Backend",
-        "endpoints": ["/api/indices", "/api/scan?index=nifty50&minRed=3"],
+        "endpoints": ["/api/indices", "/api/scan?index=nifty50&minRed=3", "/api/fno-list"],
     })
 
 
 @app.route("/api/indices")
 def list_indices():
+    indices_list = [
+        {"key": k, "label": v["label"], "count": len(v["stocks"])}
+        for k, v in INDICES.items()
+    ]
+    fno_stocks, source = get_fno_stock_list()
+    indices_list.insert(0, {"key": "fno", "label": "All F&O Stocks", "count": len(fno_stocks), "source": source})
+    return jsonify({"indices": indices_list})
+
+
+@app.route("/api/fno-list")
+def fno_list():
+    """Debug endpoint: shows the current F&O stock list and its source."""
+    stocks, source = get_fno_stock_list()
     return jsonify({
-        "indices": [
-            {"key": k, "label": v["label"], "count": len(v["stocks"])}
-            for k, v in INDICES.items()
-        ]
+        "source": source,  # "live" (from NSE), "cache", or "fallback"
+        "count": len(stocks),
+        "stocks": stocks,
     })
 
 
@@ -327,10 +571,19 @@ def scan():
     except ValueError:
         min_red = 3
 
-    if index_key not in INDICES:
-        return jsonify({"error": f"Unknown index '{index_key}'", "available": list(INDICES.keys())}), 400
+    fno_source = None
+    if index_key == "fno":
+        stocks, fno_source = get_fno_stock_list()
+        index_label = "All F&O Stocks"
+    elif index_key in INDICES:
+        stocks = INDICES[index_key]["stocks"]
+        index_label = INDICES[index_key]["label"]
+    else:
+        return jsonify({
+            "error": f"Unknown index '{index_key}'",
+            "available": ["fno"] + list(INDICES.keys())
+        }), 400
 
-    stocks = INDICES[index_key]["stocks"]
     matched = []
     failed = []
     scanned = 0
@@ -356,7 +609,7 @@ def scan():
                 "redStreak": streak,
                 "candles": data["candles"][-5:],
                 "fnoEligible": True,
-                "indexMember": INDICES[index_key]["label"],
+                "indexMember": index_label,
             })
 
         # Be polite to Yahoo — tiny delay between requests
@@ -364,8 +617,8 @@ def scan():
 
     matched.sort(key=lambda x: (-x["redStreak"], x["changePct"] or 0))
 
-    return jsonify({
-        "index": INDICES[index_key]["label"],
+    response_data = {
+        "index": index_label,
         "minRedCandles": min_red,
         "scanTime": datetime.utcnow().strftime("%d %b %Y, %H:%M UTC"),
         "totalScanned": scanned,
@@ -373,7 +626,11 @@ def scan():
         "totalMatched": len(matched),
         "results": matched,
         "failed": failed,
-    })
+    }
+    if fno_source:
+        response_data["fnoListSource"] = fno_source  # "live", "cache", or "fallback"
+
+    return jsonify(response_data)
 
 
 if __name__ == "__main__":
