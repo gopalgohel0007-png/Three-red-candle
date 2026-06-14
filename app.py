@@ -11,9 +11,8 @@ Endpoints:
   GET /api/indices     -> list of available indices
   GET /api/scan        -> run the scan
       query params:
-        index   = nifty50 | banknifty | nifty100 | sensex | fno   (default nifty50)
+        index   = nifty50 | banknifty | nifty100 | sensex   (default nifty50)
         minRed  = integer, minimum consecutive red candles   (default 3)
-  GET /api/fno-list    -> debug: current F&O stock list and source
 """
 
 from flask import Flask, jsonify, request
@@ -173,6 +172,7 @@ FALLBACK_FNO_STOCKS = [
     {"s": "LODHA", "n": "Macrotech Developers"},
     {"s": "LTF", "n": "L&T Finance"},
     {"s": "LTIM", "n": "LTIMindtree"},
+    {"s": "LUPIN", "n": "Lupin"},
     {"s": "M&MFIN", "n": "M&M Financial Services"},
     {"s": "MANAPPURAM", "n": "Manappuram Finance"},
     {"s": "MFSL", "n": "Max Financial Services"},
@@ -183,6 +183,7 @@ FALLBACK_FNO_STOCKS = [
     {"s": "NAVINFLUOR", "n": "Navin Fluorine"},
     {"s": "NBCC", "n": "NBCC India"},
     {"s": "NCC", "n": "NCC Limited"},
+    {"s": "NMDC", "n": "NMDC"},
     {"s": "OBEROIRLTY", "n": "Oberoi Realty"},
     {"s": "OFSS", "n": "Oracle Financial Services"},
     {"s": "PAGEIND", "n": "Page Industries"},
@@ -195,6 +196,7 @@ FALLBACK_FNO_STOCKS = [
     {"s": "PRESTIGE", "n": "Prestige Estates"},
     {"s": "RBLBANK", "n": "RBL Bank"},
     {"s": "RVNL", "n": "Rail Vikas Nigam"},
+    {"s": "SAIL", "n": "SAIL"},
     {"s": "SBICARD", "n": "SBI Cards"},
     {"s": "SHRIRAMFIN", "n": "Shriram Finance"},
     {"s": "SRF", "n": "SRF Limited"},
@@ -211,6 +213,7 @@ FALLBACK_FNO_STOCKS = [
     {"s": "UNITDSPR", "n": "United Spirits"},
     {"s": "UPL", "n": "UPL Limited"},
     {"s": "VBL", "n": "Varun Beverages"},
+    {"s": "VEDL", "n": "Vedanta"},
     {"s": "YESBANK", "n": "Yes Bank"},
 ]
 
@@ -220,7 +223,7 @@ def get_fno_stock_list():
     Fetch the current F&O-eligible stock list from NSE's official CSV.
     Cached for FNO_CACHE_TTL seconds. Falls back to a static list if
     NSE is unreachable.
-    Returns a tuple (list of {"s": SYMBOL, "n": NAME} dicts, source string).
+    Returns a list of {"s": SYMBOL, "n": NAME} dicts.
     """
     now = time.time()
     if _fno_cache["data"] and (now - _fno_cache["fetched_at"] < FNO_CACHE_TTL):
@@ -537,7 +540,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "RedScan Backend",
-        "endpoints": ["/api/indices", "/api/scan?index=nifty50&minRed=3", "/api/fno-list"],
+        "endpoints": ["/api/indices", "/api/scan?index=nifty50&minRed=3"],
     })
 
 
