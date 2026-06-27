@@ -32,6 +32,7 @@ pool to fetch candles concurrently rather than one-by-one.
 
 from flask import Flask, jsonify, request
 import requests
+import certifi
 from datetime import datetime
 import time
 import csv
@@ -39,6 +40,13 @@ import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
+
+# Force requests to use certifi's CA bundle explicitly instead of relying
+# on the system/Python default CA path resolution. This avoids SSLError /
+# load_verify_locations failures that can show up after a Python version
+# bump or on minimal container images (seen on Render with Python 3.14).
+SESSION = requests.Session()
+SESSION.verify = certifi.where()
 
 
 @app.after_request
@@ -246,7 +254,7 @@ def get_fno_stock_list():
         return _fno_cache["data"], "cache"
 
     try:
-        resp = requests.get(NSE_FO_CSV_URL, headers=YAHOO_HEADERS, timeout=10)
+        resp = SESSION.get(NSE_FO_CSV_URL, headers=YAHOO_HEADERS, timeout=10)
         resp.raise_for_status()
         content = resp.content.decode("utf-8", errors="ignore")
 
@@ -310,7 +318,7 @@ def get_all_nse_stocks():
         return _all_stocks_cache["data"], "cache"
 
     try:
-        resp = requests.get(NSE_ALL_EQUITY_CSV_URL, headers=YAHOO_HEADERS, timeout=15)
+        resp = SESSION.get(NSE_ALL_EQUITY_CSV_URL, headers=YAHOO_HEADERS, timeout=15)
         resp.raise_for_status()
         content = resp.content.decode("utf-8", errors="ignore")
 
@@ -562,7 +570,7 @@ def fetch_candles(sym: str, days: int = 15):
     params = {"interval": "1d", "range": f"{days}d"}
 
     try:
-        resp = requests.get(url, params=params, headers=YAHOO_HEADERS, timeout=8)
+        resp = SESSION.get(url, params=params, headers=YAHOO_HEADERS, timeout=8)
         resp.raise_for_status()
         data = resp.json()
 
@@ -709,7 +717,10 @@ def all_stocks_list():
 # ~2000 symbols — fetching those one-by-one (as the index/F&O scans do)
 # would take many minutes and risks request timeouts. A small thread
 # pool keeps Yahoo Finance load reasonable while finishing in a sane time.
-ALLSTOCKS_MAX_WORKERS = 12
+# Kept modest (rather than higher) since free-tier hosts like Render have
+# limited CPU/RAM, and too many concurrent threads risks the worker
+# getting OOM-killed or hitting gunicorn's timeout.
+ALLSTOCKS_MAX_WORKERS = 8
 
 
 def scan_stocks(stocks, min_red, fno_symbols=None, concurrent=False, max_workers=ALLSTOCKS_MAX_WORKERS):
