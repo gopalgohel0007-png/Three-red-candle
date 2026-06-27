@@ -3,16 +3,23 @@ RedScan Backend — NSE F&O Consecutive Red Candle Screener
 -----------------------------------------------------------
 This Flask server fetches daily OHLC data from Yahoo Finance
 (server-to-server, so no CORS issues) and returns stocks that
-have N+ consecutive red candles (Close < Open) on the daily
-timeframe, filtered to F&O-eligible index constituents.
+have N+ candles forming a DESCENDING STAIRCASE pattern on the
+daily timeframe (each red candle's body lower than the previous
+one's), filtered to F&O-eligible index constituents.
+
+Pattern definition (matches the reference screenshot):
+  - Each candle is RED (close < open)
+  - Each subsequent candle's open AND close are both lower than
+    the previous candle's open AND close (a "lower body" — like
+    descending stairs), not just a same-direction red streak.
 
 Endpoints:
   GET /                -> health check
   GET /api/indices     -> list of available indices
-  GET /api/scan        -> run the scan
+  GET /api/scan         -> run the scan
       query params:
-        index   = nifty50 | banknifty | nifty100 | sensex   (default nifty50)
-        minRed  = integer, minimum consecutive red candles   (default 3)
+        index   = nifty50 | banknifty | nifty100 | sensex | fno   (default nifty50)
+        minRed  = integer, minimum candles in the staircase pattern (default 3)
 """
 
 from flask import Flask, jsonify, request
@@ -503,12 +510,16 @@ def fetch_candles(sym: str, days: int = 15):
         for i, ts in enumerate(timestamps):
             o = quote["open"][i]
             c = quote["close"][i]
+            h = quote["high"][i] if i < len(quote.get("high", [])) else None
+            l = quote["low"][i] if i < len(quote.get("low", [])) else None
             if o is None or c is None:
                 continue
             candles.append({
                 "date": datetime.utcfromtimestamp(ts).strftime("%d %b"),
                 "open": round(o, 2),
                 "close": round(c, 2),
+                "high": round(h, 2) if h is not None else None,
+                "low": round(l, 2) if l is not None else None,
                 "red": c < o,
             })
 
@@ -525,7 +536,9 @@ def fetch_candles(sym: str, days: int = 15):
 
 
 def trailing_red_streak(candles):
-    """Count consecutive red candles ending at the most recent candle."""
+    """Count consecutive red candles ending at the most recent candle.
+    (Kept for reference / backward compatibility — no longer used to decide matches.)
+    """
     count = 0
     for c in reversed(candles):
         if c["red"]:
@@ -535,11 +548,52 @@ def trailing_red_streak(candles):
     return count
 
 
+def trailing_staircase_down(candles):
+    """
+    Count how many of the most recent candles form a DESCENDING STAIRCASE
+    of red candles, like the reference pattern:
+
+        ▮
+         ▮
+          ▮
+
+    Rules, checked walking backwards from the most recent candle:
+      1. The candle must be RED (close < open).
+      2. Compared to the candle right after it (i.e. the next, more
+         recent step in the staircase), BOTH its open and its close
+         must be lower (a fully lower body — not just a lower close).
+
+    Returns the length of the staircase ending at the latest candle
+    (0 if the latest candle isn't even red).
+    """
+    if not candles:
+        return 0
+
+    count = 0
+    prev = None  # the candle one step closer to "now" (i.e. came after this one)
+
+    for c in reversed(candles):
+        if not c["red"]:
+            break
+
+        if prev is not None:
+            # This candle (earlier in time) must have a HIGHER body than `prev`
+            # i.e. prev's body must be fully lower than this candle's body.
+            if not (prev["open"] < c["open"] and prev["close"] < c["close"]):
+                break
+
+        count += 1
+        prev = c
+
+    return count
+
+
 @app.route("/")
 def health():
     return jsonify({
         "status": "ok",
         "service": "RedScan Backend",
+        "pattern": "Descending staircase of red candles (each red body lower than the previous)",
         "endpoints": ["/api/indices", "/api/scan?index=nifty50&minRed=3"],
     })
 
@@ -599,7 +653,7 @@ def scan():
             failed.append({"symbol": stock["s"], "reason": err})
             continue
 
-        streak = trailing_red_streak(data["candles"])
+        streak = trailing_staircase_down(data["candles"])
         if streak >= min_red:
             price = data["price"]
             prev = data["prevClose"]
@@ -623,6 +677,7 @@ def scan():
     response_data = {
         "index": index_label,
         "minRedCandles": min_red,
+        "pattern": "staircase_down",
         "scanTime": datetime.utcnow().strftime("%d %b %Y, %H:%M UTC"),
         "totalScanned": scanned,
         "totalFailed": len(failed),
