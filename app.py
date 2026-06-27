@@ -18,8 +18,16 @@ Endpoints:
   GET /api/indices     -> list of available indices
   GET /api/scan         -> run the scan
       query params:
-        index   = nifty50 | banknifty | nifty100 | sensex | fno   (default nifty50)
+        index   = nifty50 | banknifty | nifty100 | sensex | fno | allstocks   (default nifty50)
         minRed  = integer, minimum candles in the staircase pattern (default 3)
+
+"allstocks" scans every NSE-listed equity (~2000 symbols) instead of
+just an index/F&O list. Each result is tagged with fnoEligible: true/false
+so the trader can see which staircase matches are also tradeable via options
+(NSE F&O currently covers ~180-220 of those ~2000 names — options trading is
+only available on F&O-eligible stocks, there's no separate larger "options
+list"). Because this scans a much bigger universe, it uses a small thread
+pool to fetch candles concurrently rather than one-by-one.
 """
 
 from flask import Flask, jsonify, request
@@ -28,6 +36,7 @@ from datetime import datetime
 import time
 import csv
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
@@ -271,6 +280,67 @@ def get_fno_stock_list():
 
     except Exception:
         return FALLBACK_FNO_STOCKS, "fallback"
+
+
+# ──────────────────────────────────────────────────────────
+# ALL NSE-listed equities — fetched live from NSE, cached
+# Used by the "All Stocks" scan option (~2000 symbols)
+# ──────────────────────────────────────────────────────────
+NSE_ALL_EQUITY_CSV_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+
+_all_stocks_cache = {"data": None, "fetched_at": 0}
+ALL_STOCKS_CACHE_TTL = 6 * 60 * 60  # 6 hours
+
+# Small fallback used only if NSE's full equity list is unreachable.
+# (Not meant to be exhaustive — just keeps the "All Stocks" option from
+# returning nothing if NSE is briefly down. The live fetch is what
+# actually delivers ~2000 names.)
+FALLBACK_ALL_STOCKS = FALLBACK_FNO_STOCKS
+
+
+def get_all_nse_stocks():
+    """
+    Fetch every NSE-listed equity (EQ/BE series) from NSE's official
+    EQUITY_L.csv. Cached for ALL_STOCKS_CACHE_TTL seconds. Falls back
+    to a small static list if NSE is unreachable.
+    Returns a list of {"s": SYMBOL, "n": NAME} dicts (~2000 entries).
+    """
+    now = time.time()
+    if _all_stocks_cache["data"] and (now - _all_stocks_cache["fetched_at"] < ALL_STOCKS_CACHE_TTL):
+        return _all_stocks_cache["data"], "cache"
+
+    try:
+        resp = requests.get(NSE_ALL_EQUITY_CSV_URL, headers=YAHOO_HEADERS, timeout=15)
+        resp.raise_for_status()
+        content = resp.content.decode("utf-8", errors="ignore")
+
+        reader = csv.reader(io.StringIO(content))
+        rows = list(reader)
+
+        stocks = []
+        seen = set()
+        for row in rows:
+            if len(row) < 2:
+                continue
+            symbol = row[0].strip().upper()
+            name = row[1].strip() if len(row) > 1 else ""
+            if not symbol or symbol == "SYMBOL":
+                continue
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            stocks.append({"s": symbol, "n": name or symbol})
+
+        if len(stocks) < 500:
+            # Sanity check failed — CSV format may have changed
+            raise ValueError(f"Parsed only {len(stocks)} stocks, expected 1500+")
+
+        _all_stocks_cache["data"] = stocks
+        _all_stocks_cache["fetched_at"] = now
+        return stocks, "live"
+
+    except Exception:
+        return FALLBACK_ALL_STOCKS, "fallback"
 
 
 # ──────────────────────────────────────────────────────────
@@ -594,7 +664,7 @@ def health():
         "status": "ok",
         "service": "RedScan Backend",
         "pattern": "Descending staircase of red candles (each red body lower than the previous)",
-        "endpoints": ["/api/indices", "/api/scan?index=nifty50&minRed=3"],
+        "endpoints": ["/api/indices", "/api/scan?index=nifty50&minRed=3", "/api/scan?index=allstocks&minRed=3"],
     })
 
 
@@ -604,8 +674,12 @@ def list_indices():
         {"key": k, "label": v["label"], "count": len(v["stocks"])}
         for k, v in INDICES.items()
     ]
-    fno_stocks, source = get_fno_stock_list()
-    indices_list.insert(0, {"key": "fno", "label": "All F&O Stocks", "count": len(fno_stocks), "source": source})
+    fno_stocks, fno_source = get_fno_stock_list()
+    indices_list.insert(0, {"key": "fno", "label": "All F&O Stocks", "count": len(fno_stocks), "source": fno_source})
+
+    all_stocks, all_source = get_all_nse_stocks()
+    indices_list.insert(0, {"key": "allstocks", "label": "All Stocks (NSE)", "count": len(all_stocks), "source": all_source})
+
     return jsonify({"indices": indices_list})
 
 
@@ -620,6 +694,83 @@ def fno_list():
     })
 
 
+@app.route("/api/all-stocks-list")
+def all_stocks_list():
+    """Debug endpoint: shows the current full NSE equity list and its source."""
+    stocks, source = get_all_nse_stocks()
+    return jsonify({
+        "source": source,  # "live" (from NSE), "cache", or "fallback"
+        "count": len(stocks),
+        "stocks": stocks,
+    })
+
+
+# How many stocks to fetch in parallel. NSE's "All Stocks" universe is
+# ~2000 symbols — fetching those one-by-one (as the index/F&O scans do)
+# would take many minutes and risks request timeouts. A small thread
+# pool keeps Yahoo Finance load reasonable while finishing in a sane time.
+ALLSTOCKS_MAX_WORKERS = 12
+
+
+def scan_stocks(stocks, min_red, fno_symbols=None, concurrent=False, max_workers=ALLSTOCKS_MAX_WORKERS):
+    """
+    Run the staircase-down scan over a list of {"s","n"} stocks.
+
+    fno_symbols: optional set of symbols that are F&O-eligible, used to
+    tag each match with an accurate fnoEligible flag instead of assuming
+    everything scanned is options-tradeable.
+
+    concurrent: if True, fetch candles for all stocks in a thread pool
+    instead of one at a time (used for the large "All Stocks" universe).
+
+    Returns (matched, failed, scanned_count).
+    """
+    matched = []
+    failed = []
+    scanned = 0
+
+    def handle_result(stock, data, err):
+        nonlocal scanned
+        scanned += 1
+        if err:
+            failed.append({"symbol": stock["s"], "reason": err})
+            return
+        streak = trailing_staircase_down(data["candles"])
+        if streak >= min_red:
+            price = data["price"]
+            prev = data["prevClose"]
+            change_pct = ((price - prev) / prev * 100) if (price and prev) else None
+            is_fno = (stock["s"] in fno_symbols) if fno_symbols is not None else True
+            matched.append({
+                "symbol": stock["s"],
+                "name": stock["n"],
+                "price": price,
+                "changePct": round(change_pct, 2) if change_pct is not None else None,
+                "redStreak": streak,
+                "candles": data["candles"][-5:],
+                "fnoEligible": is_fno,
+            })
+
+    if concurrent:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_stock = {pool.submit(fetch_candles, stock["s"]): stock for stock in stocks}
+            for future in as_completed(future_to_stock):
+                stock = future_to_stock[future]
+                try:
+                    data, err = future.result()
+                except Exception as e:
+                    data, err = None, str(e)
+                handle_result(stock, data, err)
+    else:
+        for stock in stocks:
+            data, err = fetch_candles(stock["s"])
+            handle_result(stock, data, err)
+            # Be polite to Yahoo — tiny delay between requests
+            time.sleep(0.05)
+
+    return matched, failed, scanned
+
+
 @app.route("/api/scan")
 def scan():
     index_key = request.args.get("index", "nifty50")
@@ -629,48 +780,48 @@ def scan():
         min_red = 3
 
     fno_source = None
-    if index_key == "fno":
+    all_stocks_source = None
+
+    if index_key == "allstocks":
+        stocks, all_stocks_source = get_all_nse_stocks()
+        fno_stocks, fno_source = get_fno_stock_list()
+        fno_symbols = {s["s"] for s in fno_stocks}
+        index_label = "All Stocks (NSE)"
+
+        matched, failed, scanned = scan_stocks(
+            stocks, min_red, fno_symbols=fno_symbols, concurrent=True
+        )
+        for m in matched:
+            m["indexMember"] = index_label
+
+    elif index_key == "fno":
         stocks, fno_source = get_fno_stock_list()
         index_label = "All F&O Stocks"
+        fno_symbols = {s["s"] for s in stocks}
+
+        matched, failed, scanned = scan_stocks(
+            stocks, min_red, fno_symbols=fno_symbols, concurrent=False
+        )
+        for m in matched:
+            m["indexMember"] = index_label
+
     elif index_key in INDICES:
         stocks = INDICES[index_key]["stocks"]
         index_label = INDICES[index_key]["label"]
+        fno_stocks, fno_source = get_fno_stock_list()
+        fno_symbols = {s["s"] for s in fno_stocks}
+
+        matched, failed, scanned = scan_stocks(
+            stocks, min_red, fno_symbols=fno_symbols, concurrent=False
+        )
+        for m in matched:
+            m["indexMember"] = index_label
+
     else:
         return jsonify({
             "error": f"Unknown index '{index_key}'",
-            "available": ["fno"] + list(INDICES.keys())
+            "available": ["fno", "allstocks"] + list(INDICES.keys())
         }), 400
-
-    matched = []
-    failed = []
-    scanned = 0
-
-    for stock in stocks:
-        data, err = fetch_candles(stock["s"])
-        scanned += 1
-
-        if err:
-            failed.append({"symbol": stock["s"], "reason": err})
-            continue
-
-        streak = trailing_staircase_down(data["candles"])
-        if streak >= min_red:
-            price = data["price"]
-            prev = data["prevClose"]
-            change_pct = ((price - prev) / prev * 100) if (price and prev) else None
-            matched.append({
-                "symbol": stock["s"],
-                "name": stock["n"],
-                "price": price,
-                "changePct": round(change_pct, 2) if change_pct is not None else None,
-                "redStreak": streak,
-                "candles": data["candles"][-5:],
-                "fnoEligible": True,
-                "indexMember": index_label,
-            })
-
-        # Be polite to Yahoo — tiny delay between requests
-        time.sleep(0.05)
 
     matched.sort(key=lambda x: (-x["redStreak"], x["changePct"] or 0))
 
@@ -687,6 +838,8 @@ def scan():
     }
     if fno_source:
         response_data["fnoListSource"] = fno_source  # "live", "cache", or "fallback"
+    if all_stocks_source:
+        response_data["allStocksListSource"] = all_stocks_source  # "live", "cache", or "fallback"
 
     return jsonify(response_data)
 
