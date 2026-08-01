@@ -526,11 +526,33 @@ def get_bse_stock_list():
         if not isinstance(data, list) or len(data) < 500:
             raise ValueError(f"Unexpected BSE response shape/size: {len(data) if isinstance(data, list) else type(data)}")
 
+        # Log the actual keys of the first record once, so if BSE changes
+        # their field names again this tells us immediately instead of
+        # silently parsing 0 stocks.
+        if data:
+            log(f"BSE response sample keys: {list(data[0].keys())}")
+
+        # BSE's field names have changed/varied across API versions
+        # (SC_CODE, ScripCode, scrip_cd, Scrip_Cd, etc.). Instead of
+        # guessing a fixed pair, scan the keys case-insensitively for
+        # anything containing "code" (but not e.g. "groupcode") and
+        # anything containing "name".
+        def find_value(row, contains_options):
+            for k, v in row.items():
+                kl = k.lower()
+                if any(opt in kl for opt in contains_options):
+                    return v
+            return None
+
         stocks = []
         seen = set()
         for row in data:
-            code = str(row.get("SC_CODE") or row.get("scrip_cd") or "").strip()
-            name = (row.get("SC_NAME") or row.get("scrip_name") or "").strip()
+            if not isinstance(row, dict):
+                continue
+            code_val = find_value(row, ["sc_code", "scripcode", "scrip_cd", "code"])
+            name_val = find_value(row, ["sc_name", "scripname", "scrip_name", "name"])
+            code = str(code_val).strip() if code_val is not None else ""
+            name = str(name_val).strip() if name_val is not None else ""
             if not code or code in seen:
                 continue
             seen.add(code)
