@@ -466,8 +466,16 @@ def get_all_nse_stocks():
 # Used by the new "bse" scan option (~4000 symbols)
 # ──────────────────────────────────────────────────────────
 BSE_LIST_URL = "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
-BSE_LIST_PARAMS = {
-    "Group": "",
+
+# BSE's list endpoint is group-oriented. Asking for an empty group is
+# unreliable and, depending on the API version, can return a partial/empty
+# response. Fetch every valid equity group separately and merge the results.
+BSE_GROUPS = [
+    "A", "B", "E", "F", "FC", "GC", "I", "IF", "IP", "M", "MS", "MT",
+    "P", "R", "T", "TS", "W", "X", "XD", "XT", "Y", "Z", "ZP", "ZY",
+]
+
+BSE_BASE_PARAMS = {
     "scripcode": "",
     "industry": "",
     "segment": "Equity",
@@ -475,10 +483,12 @@ BSE_LIST_PARAMS = {
 }
 BSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                  "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.bseindia.com/",
     "Origin": "https://www.bseindia.com",
+    "Connection": "keep-alive",
 }
 
 _bse_cache = {"data": None, "fetched_at": 0}
@@ -502,14 +512,14 @@ FALLBACK_BSE_STOCKS = [
 
 def get_bse_stock_list():
     """
-    Fetch every active BSE-listed equity from BSE's public scrip-list API.
-    Cached for BSE_CACHE_TTL seconds. Falls back to a small static list if
-    BSE is unreachable.
+    Fetch active BSE-listed equities by querying every BSE equity group and
+    merging/deduplicating the results.
 
-    Yahoo Finance identifies BSE-listed stocks by their numeric BSE scrip
-    code + ".BO" (e.g. "500325.BO" for Reliance on BSE), so we store the
-    scrip code as the symbol ("s") — NOT the ticker abbreviation.
+    BSE's endpoint has appeared in both of these response shapes:
+      - [ {...}, {...} ]
+      - {"Table": [ {...}, {...} ], ...}
 
+    Yahoo Finance identifies BSE stocks by numeric scrip code + ".BO".
     Returns (stocks, source) where source is "live" | "cache" | "fallback".
     """
     now = time.time()
@@ -517,49 +527,76 @@ def get_bse_stock_list():
         return _bse_cache["data"], "cache"
 
     try:
-        resp = SESSION.get(
-            BSE_LIST_URL, params=BSE_LIST_PARAMS, headers=BSE_HEADERS, timeout=15
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        stocks = []
+        seen = set()
+        successful_groups = 0
 
-        if not isinstance(data, list) or len(data) < 500:
-            raise ValueError(f"Unexpected BSE response shape/size: {len(data) if isinstance(data, list) else type(data)}")
-
-        # Log the actual keys of the first record once, so if BSE changes
-        # their field names again this tells us immediately instead of
-        # silently parsing 0 stocks.
-        if data:
-            log(f"BSE response sample keys: {list(data[0].keys())}")
-
-        # BSE's field names have changed/varied across API versions
-        # (SC_CODE, ScripCode, scrip_cd, Scrip_Cd, etc.). Instead of
-        # guessing a fixed pair, scan the keys case-insensitively for
-        # anything containing "code" (but not e.g. "groupcode") and
-        # anything containing "name".
         def find_value(row, contains_options):
             for k, v in row.items():
-                kl = k.lower()
+                kl = str(k).lower().replace("-", "_").replace(" ", "_")
                 if any(opt in kl for opt in contains_options):
                     return v
             return None
 
-        stocks = []
-        seen = set()
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            code_val = find_value(row, ["sc_code", "scripcode", "scrip_cd", "code"])
-            name_val = find_value(row, ["sc_name", "scripname", "scrip_name", "name"])
-            code = str(code_val).strip() if code_val is not None else ""
-            name = str(name_val).strip() if name_val is not None else ""
-            if not code or code in seen:
-                continue
-            seen.add(code)
-            stocks.append({"s": code, "n": name or code})
+        for group in BSE_GROUPS:
+            params = dict(BSE_BASE_PARAMS)
+            params["Group"] = group
+            try:
+                resp = SESSION.get(
+                    BSE_LIST_URL, params=params, headers=BSE_HEADERS, timeout=15
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+
+                if isinstance(payload, list):
+                    rows = payload
+                elif isinstance(payload, dict):
+                    # Current/older BSE API variants use Table/Table1.
+                    rows = payload.get("Table")
+                    if not isinstance(rows, list):
+                        rows = payload.get("Table1")
+                    if not isinstance(rows, list):
+                        # Some variants wrap the rows under a data/result key.
+                        rows = payload.get("data") or payload.get("result") or []
+                else:
+                    rows = []
+
+                if not rows:
+                    log(f"BSE group {group}: empty response")
+                    continue
+
+                successful_groups += 1
+
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+
+                    code_val = find_value(
+                        row, ["sc_code", "scripcode", "scrip_cd", "security_code", "code"]
+                    )
+                    name_val = find_value(
+                        row, ["sc_name", "scripname", "scrip_name", "security_name", "name"]
+                    )
+
+                    code = str(code_val).strip() if code_val is not None else ""
+                    name = str(name_val).strip() if name_val is not None else ""
+
+                    # Yahoo's BSE symbols must be numeric 6-digit scrip codes.
+                    if not code.isdigit() or len(code) != 6 or code in seen:
+                        continue
+
+                    seen.add(code)
+                    stocks.append({"s": code, "n": name or code})
+
+            except Exception as group_error:
+                log(f"BSE group {group} fetch failed: {group_error}")
+
+        log(f"BSE list: {len(stocks)} unique securities from {successful_groups}/{len(BSE_GROUPS)} groups")
 
         if len(stocks) < 500:
-            raise ValueError(f"Parsed only {len(stocks)} BSE stocks, expected 3000+")
+            raise ValueError(
+                f"Parsed only {len(stocks)} BSE stocks from {successful_groups} groups, expected 3000+"
+            )
 
         _bse_cache["data"] = stocks
         _bse_cache["fetched_at"] = now
