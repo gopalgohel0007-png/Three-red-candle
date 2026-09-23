@@ -468,7 +468,7 @@ def get_all_nse_stocks():
 BSE_LIST_URL = "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
 BSE_LIST_PARAMS = {
     "Group": "",
-    "Scripcode": "",
+    "scripcode": "",
     "industry": "",
     "segment": "Equity",
     "status": "Active",
